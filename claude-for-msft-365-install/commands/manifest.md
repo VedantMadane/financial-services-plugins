@@ -23,7 +23,7 @@ Prompt only for the keys their cloud path needs. Don't ask for all eight.
 |---|---|
 | Vertex | `gcp_project_id` `gcp_region` `google_client_id` `google_client_secret` |
 | Bedrock | `aws_role_arn` `aws_region` |
-| Foundry | `azure_resource_name` `azure_api_key` |
+| Foundry | `azure_resource_name` `azure_api_key` — or keyless: `azure_resource_name` + Entra (see [Foundry keyless](#use-the-entra-token-for-foundry-keyless)) |
 | Gateway | `gateway_url` `gateway_token` `gateway_auth_header` `gateway_api_format` |
 | Gateway (`gateway_api_format=vertex`) | also `gcp_project_id` `gcp_region` |
 
@@ -168,6 +168,43 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/build-manifest.mjs" office manifest.xml \
 implies `gateway_auth_header=authorization`, so you can omit that key. Don't
 also set `gateway_token` — it's ignored, and the script warns.
 
+## Use the Entra token for Foundry (keyless)
+
+Foundry direct normally takes the resource's static `azure_api_key`. To drop the
+key and have each user authenticate with their own Entra identity, set
+`gateway_auth_source=entra` alongside `azure_resource_name` and leave
+`azure_api_key` out. The scope targets Azure's Cognitive Services resource, not
+an API you expose:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/build-manifest.mjs" office manifest.xml \
+  azure_resource_name=<your-foundry-resource> \
+  entra_sso=1 \
+  graph_client_id=<your-app-guid> \
+  entra_scope=https://cognitiveservices.azure.com/.default \
+  gateway_auth_source=entra
+```
+
+The add-in acquires an access token audienced to `cognitiveservices.azure.com`
+and sends it as `Authorization: Bearer` on every Foundry call, re-acquiring it
+before expiry. Azure validates the token, then checks that the user holds the
+**Cognitive Services User** role on the resource — no key is stored anywhere.
+The Entra app needs the Azure Cognitive Services `user_impersonation` delegated
+permission (not a self-exposed API); see [entra-app](entra-app.md). If both
+`azure_api_key` and `gateway_auth_source=entra` are present, the key is ignored.
+
+**Why `cognitiveservices.azure.com`, not `ai.azure.com`.** The add-in signs each
+user in through Nested App Authentication against your Entra app, and that
+per-user *delegated* flow pairs with the app's Azure Cognitive Services
+`user_impersonation` permission, whose audience is
+`https://cognitiveservices.azure.com`. This is the same scope Claude Desktop's
+Foundry sign-in uses, so an Entra app already registered for Desktop works
+unchanged. Microsoft's SDK and managed-identity docs use `https://ai.azure.com/.default`
+instead; a Foundry resource accepts both audiences, but that scope belongs to the
+credential-based SDK flow (`DefaultAzureCredential`, `az login`, service
+principal), which doesn't use an app-registration delegated permission. For the
+add-in's per-user sign-in, use `cognitiveservices.azure.com/.default`.
+
 **Entra setup:** see [entra-app](entra-app.md) — the *Gateway / bootstrap auth*
 row of the permissions table, plus the
 [backend validation](entra-app.md#what-your-backend-validates) section for the
@@ -263,6 +300,10 @@ locked for users. Slugs use `<domain>.<action>` form. Currently enforced:
 | Slug | Effect |
 |---|---|
 | `skills.authoring` | Blocks creating, editing, and uploading skills (create/update tools, `/skillify`, `.skill` upload + drag-drop, skill editing UI). Running admin-provisioned skills is unaffected. |
+| `thumbs` | Blocks response feedback (thumbs up / down and the follow-up prompt). |
+| `addin.access` | Kill switch — the add-in refuses to run. Almost always wants a document `resource`; use [access-policies](access-policies.md). |
+| `file.upload` | Blocks attaching files to the conversation. Same — usually scoped by `resource`. |
+| `web_search` | Removes the native web_search and web_fetch server tools (queries otherwise egress to Anthropic's third-party search provider) and the user-facing web-search toggle. Code execution is unaffected. Pair with [`mcp_servers`](#mcp_servers) to substitute your own in-network search tool — with native search disabled, the model uses the tool you attach. |
 
 ```bash
 disabled_features='skills.authoring'
@@ -271,6 +312,50 @@ disabled_features='skills.authoring'
 Unknown slugs are ignored (forward-compatible). Setting it here applies one
 policy org-wide; per-user policy belongs in [bootstrap](bootstrap.md#disabled_features)
 (JSON array) or extension attrs (comma-separated).
+
+## available_models
+
+`available_models` **overrides** the model picker — when set, users see exactly
+the models listed, in the listed order, and nothing else. It replaces the
+retired `disabled_models` / `additional_models` pair: because it is an
+override, it must include every backend model users should keep, not just
+additions or removals.
+
+Two formats:
+
+```bash
+# comma-separated ids
+available_models='claude-opus-4-8,claude-sonnet-5'
+
+# JSON, when picker labels matter — an array of ids and/or {id, label} objects
+available_models='[{"id":"claude-opus-4-8","label":"Opus 4.8"},"claude-sonnet-5"]'
+```
+
+Unset (or empty) means the picker is unchanged. Setting it here applies
+org-wide; per-user policy belongs in [bootstrap](bootstrap.md#available_models).
+
+## access_policies
+
+`access_policies` is the IAM-shaped successor to `disabled_features` — a JSON
+array of allow/deny statements that gates add-in features:
+
+- **No `resource`** — the statement applies everywhere, exactly like a
+  `disabled_features` entry (off for everyone).
+- **With a `resource`** — the rule is scoped to matching documents, identified
+  by Purview sensitivity label or, for the open document, by file path (block
+  the add-in entirely on top-secret documents or on a restricted network share,
+  or refuse attaching restricted Office/PDF files).
+
+It covers everything `disabled_features` does, plus conditions, allowlists, and
+per-statement attribution. Building one usually means fetching label GUIDs
+from Purview, so use the guided command:
+[access-policies](access-policies.md). Then pass the result as one more key:
+
+```bash
+access_policies='[{"effect":"deny","action":"addin.access","resource":{"type":"open_file","identifiers":[{"type":"mip_label_guid","equals":"<guid>"}]}}]'
+```
+
+Manifest / bootstrap only — the array does not fit in Entra extension attributes.
 
 ## Version
 
